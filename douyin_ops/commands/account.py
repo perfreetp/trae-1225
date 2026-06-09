@@ -81,25 +81,81 @@ def cmd_import(input_file, output_file, sheet, append):
               help='输出文件（默认覆盖源文件）')
 @click.option('--by', 'group_by', default='分组', show_default=True,
               help='按哪个字段分组（如 分组/MCN/认证状态）')
-@click.option('--set-group', 'set_group', multiple=True, type=(str, str),
-              help='手动设置账号分组，格式：账号ID=分组名，可多次指定')
+@click.option('--set-group', 'set_group', multiple=True, type=str,
+              help='手动设置分组，格式：账号ID=分组名，批量：ID1,ID2=分组名，可多次指定')
 @click.option('--auto/--no-auto', default=False, show_default=True,
               help='按粉丝数自动分层分组')
 def cmd_group(input_file, output_file, group_by, set_group, auto):
-    """按字段分组账号或手动设置分组。"""
+    """按字段分组账号或手动设置分组。
+
+    \b
+    --set-group 支持格式：
+      单个账号：  --set-group 1001=美妆类
+      批量账号：  --set-group "1001,1002,1005=达人专区"
+      多次指定：  --set-group 1001=美妆 --set-group 1002=美食
+    """
     header('账号分组')
     output_file = output_file or input_file
 
     df = read_data(input_file)
     info(f'读取账号数: {len(df)}')
 
-    for account_id, group_name in set_group:
-        mask = df['账号ID'].astype(str) == str(account_id)
-        if mask.any():
-            df.loc[mask, group_by] = group_name
-            success(f'已设置 {account_id} → {group_name}')
-        else:
-            warn(f'未找到账号ID: {account_id}')
+    if set_group:
+        info(f'解析 {len(set_group)} 条 --set-group 规则...')
+    total_set = 0
+    parse_errors = []
+
+    for rule_idx, raw_rule in enumerate(set_group, 1):
+        rule = raw_rule.strip()
+        if not rule:
+            parse_errors.append(f'第 {rule_idx} 条规则为空："{raw_rule}"')
+            continue
+        if '=' not in rule:
+            parse_errors.append(
+                f'第 {rule_idx} 条格式错误："{raw_rule}"\n'
+                f'    期望格式：账号ID=分组名  或  ID1,ID2=分组名\n'
+                f'    示例：1001=美妆类  或  "1001,1002=达人专区"'
+            )
+            continue
+        ids_part, _, group_name = rule.partition('=')
+        ids_part = ids_part.strip()
+        group_name = group_name.strip()
+        if not ids_part:
+            parse_errors.append(f'第 {rule_idx} 条缺少账号ID："{raw_rule}"')
+            continue
+        if not group_name:
+            parse_errors.append(f'第 {rule_idx} 条缺少分组名："{raw_rule}"')
+            continue
+        account_ids = [a.strip() for a in ids_part.split(',') if a.strip()]
+        if not account_ids:
+            parse_errors.append(f'第 {rule_idx} 条账号ID列表为空："{raw_rule}"')
+            continue
+        hit_any = False
+        for aid in account_ids:
+            mask = df['账号ID'].astype(str).str.strip() == str(aid).strip()
+            if mask.any():
+                df.loc[mask, group_by] = group_name
+                total_set += int(mask.sum())
+                hit_any = True
+                info(f'  ✓ {aid} → {group_name} ({int(mask.sum())} 条)')
+            else:
+                warn(f'  ✗ 未找到账号ID: {aid}')
+        if not hit_any:
+            warn(f'  （本条规则没有匹配到任何账号）')
+
+    if parse_errors:
+        error(f'--set-group 解析错误（共 {len(parse_errors)} 条）:')
+        for e in parse_errors:
+            error(f'  * {e}')
+        error('正确用法示例：')
+        error('  单账号： douyin account group ... --set-group 1001=美妆类')
+        error('  批量：   douyin account group ... --set-group "1001,1002,1005=达人专区"')
+        error('  多条：   douyin account group ... --set-group 1001=美妆 --set-group 1002=美食')
+        if total_set == 0:
+            error('因所有规则均解析失败，未进行任何分组修改')
+
+    if total_set > 0:
+        success(f'手动分组共设置 {total_set} 条账号')
 
     if auto and '粉丝数' in df.columns:
         info('自动按粉丝数分层分组...')

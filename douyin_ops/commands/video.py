@@ -48,15 +48,17 @@ def _guess_cover(video_path: str) -> str:
     """查找同名封面图片。"""
     base = os.path.splitext(video_path)[0]
     for ext in IMAGE_EXTS:
-        p = base + ext
-        if os.path.exists(p):
-            return p
+        for case_ext in [ext, ext.upper(), ext.title()]:
+            p = base + case_ext
+            if os.path.exists(p):
+                return p
     dir_ = os.path.dirname(video_path)
     name = os.path.basename(base)
     for ext in IMAGE_EXTS:
-        p = os.path.join(dir_, 'covers', name + ext)
-        if os.path.exists(p):
-            return p
+        for case_ext in [ext, ext.upper(), ext.title()]:
+            p = os.path.join(dir_, 'covers', name + case_ext)
+            if os.path.exists(p):
+                return p
     return ''
 
 
@@ -74,18 +76,21 @@ def video():
 @click.option('-o', '--output', 'output_file', default='data/video_list.xlsx',
               show_default=True, help='输出清单文件')
 def cmd_scan(scan_dir, recursive, output_file):
-    """扫描本地视频文件生成清单。"""
+    """扫描本地视频文件生成清单（支持 .MP4/.MOV 等大写扩展名）。"""
     header('扫描视频文件')
     info(f'扫描目录: {scan_dir}（递归={recursive}）')
 
     pattern = '**/*' if recursive else '*'
     files = []
     for ext in VIDEO_EXTS:
-        files.extend(glob.glob(os.path.join(scan_dir, pattern + ext), recursive=recursive))
+        for case_ext in [ext, ext.upper(), ext.title()]:
+            matched = glob.glob(os.path.join(scan_dir, pattern + case_ext), recursive=recursive)
+            files.extend(matched)
     files = sorted(set(files))
 
     if not files:
         warn('未找到任何视频文件')
+        info(f'尝试匹配的扩展名: {sorted(set(e + "/" + e.upper() for e in VIDEO_EXTS))}')
         return
 
     info(f'找到 {len(files)} 个视频，处理中...')

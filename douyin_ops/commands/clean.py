@@ -188,13 +188,33 @@ def cmd_purge(input_file, content_dir, days, status_col, date_col, path_cols,
     info(f'读取 {len(df)} 条记录')
 
     cutoff = datetime.now() - timedelta(days=days)
+    total = len(df)
 
     df['_date'] = pd.to_datetime(df[date_col], errors='coerce') if date_col in df.columns else pd.NaT
-    has_date = df['_date'].notna()
-    old = df['_date'] < cutoff if has_date else pd.Series([True] * len(df))
-    in_status = df[status_col].astype(str).isin(expired_status) if status_col in df.columns else pd.Series([True] * len(df))
-    mask = old & in_status
+    any_valid_date = bool(df['_date'].notna().any()) if date_col in df.columns else False
+
+    if date_col in df.columns and any_valid_date:
+        old_mask = (df['_date'] < cutoff) | df['_date'].isna()
+        info(f'按日期筛选: 早于 {cutoff.strftime("%Y-%m-%d")}（共 {days} 天前） 或日期无效')
+    else:
+        if date_col in df.columns and not any_valid_date:
+            warn(f'日期列 "{date_col}" 存在但全部无法解析为有效日期，将忽略日期条件，仅按状态筛选')
+        else:
+            warn(f'未找到日期列 "{date_col}"，将忽略日期条件，仅按状态筛选')
+        old_mask = pd.Series([True] * total, index=df.index)
+
+    if status_col in df.columns:
+        status_mask = df[status_col].astype(str).isin(list(expired_status))
+        info(f'按状态筛选: 属于 {list(expired_status)}')
+    else:
+        warn(f'未找到状态列 "{status_col}"，将忽略状态条件，仅按日期筛选')
+        status_mask = pd.Series([True] * total, index=df.index)
+
+    mask = old_mask & status_mask
     expired = df[mask].copy()
+
+    remain = total - len(expired)
+    info(f'筛选用时: 日期通过 {int(old_mask.sum())}/{total}，状态通过 {int(status_mask.sum())}/{total}')
 
     info(f'过期记录: {len(expired)} 条')
     if len(expired) == 0:

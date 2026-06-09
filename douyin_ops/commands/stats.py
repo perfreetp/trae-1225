@@ -73,7 +73,7 @@ def cmd_summary(input_file, output_file, group_by, start, end):
             df = df[df['_date'] <= parse_date(end)]
         info(f'日期过滤后: {len(df)} 行')
 
-    metrics = ['播放量', '点赞数', '评论数', '转发数', '收藏数', '涨粉数']
+    metrics = ['播放量', '点赞数', '评论数', '转发数', '收藏数', '涨粉数', '完播率']
     col_map = {}
     for m in metrics:
         c = _resolve_col(df.columns, m)
@@ -83,36 +83,64 @@ def cmd_summary(input_file, output_file, group_by, start, end):
     info(f'识别到字段: {list(col_map.keys())}')
 
     sheets = {}
-    total = {}
+    total_rows = []
     for m, c in col_map.items():
         s = _to_num(df[c])
-        total[m] = [int(s.sum()), round(s.mean(), 1), int(s.max()), int(s.median())]
-    if total:
-        total_df = pd.DataFrame.from_dict(total, orient='index',
-                                          columns=['总计', '均值', '最大值', '中位数'])
-        total_df.insert(0, '指标', total_df.index)
+        is_pct = (m == '完播率')
+        if is_pct:
+            total_rows.append([
+                m,
+                f'{s.mean():.2%}',
+                f'{s.mean():.2%}',
+                f'{s.max():.2%}',
+                f'{s.median():.2%}',
+            ])
+        else:
+            total_rows.append([
+                m,
+                int(s.sum()),
+                round(s.mean(), 1),
+                int(s.max()),
+                int(s.median()),
+            ])
+    if total_rows:
+        total_df = pd.DataFrame(total_rows, columns=['指标', '总计', '均值', '最大值', '中位数'])
         sheets['总览'] = total_df
         info('总览:')
         print_table(total_df.columns.tolist(), total_df.values.tolist())
 
-    finish_col = _resolve_col(df.columns, '完播率')
-    if finish_col:
-        fr = _to_num(df[finish_col])
-        info(f'完播率: 均值 {fr.mean():.1%} / 中位 {fr.median():.1%}')
-
     if group_by:
         gb = _resolve_col(df.columns, group_by) or group_by
         if gb in df.columns:
-            agg = {}
+            work = df[[gb]].copy()
             for m, c in col_map.items():
-                df[c + '_num'] = _to_num(df[c])
-                agg[c + '_num'] = ['sum', 'mean', 'count']
-            grouped = df.groupby(gb).agg(agg).round(1)
-            grouped.columns = [f'{m}_{fn}' for m, fn in grouped.columns]
-            grouped = grouped.reset_index()
+                work[m] = _to_num(df[c])
+            work['_cnt'] = 1
+            agg_spec = {'条数': ('_cnt', 'count')}
+            for m in col_map:
+                if m == '完播率':
+                    agg_spec[m] = (m, 'mean')
+                else:
+                    agg_spec[m + '_总计'] = (m, 'sum')
+                    agg_spec[m + '_均值'] = (m, 'mean')
+            grouped = work.groupby(gb).agg(**agg_spec).reset_index()
+            for col in grouped.columns:
+                if '完播率' in col and col != gb:
+                    grouped[col] = grouped[col].apply(lambda x: f'{x:.2%}' if pd.notna(x) else x)
+            ordered = [gb, '条数']
+            for m in col_map:
+                if m == '完播率':
+                    if m in grouped.columns:
+                        ordered.append(m)
+                else:
+                    for suffix in ['_总计', '_均值']:
+                        c = m + suffix
+                        if c in grouped.columns:
+                            ordered.append(c)
+            grouped = grouped[[c for c in ordered if c in grouped.columns]]
             sheets[f'按{group_by}'] = grouped
             info(f'按{group_by}分组: {len(grouped)} 组')
-            preview_cols = list(grouped.columns[:5])
+            preview_cols = list(grouped.columns[:min(6, len(grouped.columns))])
             print_table(preview_cols, grouped.head(10)[preview_cols].values.tolist())
         else:
             warn(f'分组字段不存在: {gb}')
