@@ -76,7 +76,12 @@ def stats():
               help='输出本周vs上周、本月vs上月周期对比')
 @click.option('--ref-date', default=None,
               help='周期对比的参照日期（YYYY-MM-DD，默认今天）')
-def cmd_summary(input_file, output_file, group_by, start, end, compare, ref_date):
+@click.option('--rank-metrics', multiple=True, default=None,
+              help='只看指定指标的变化排行（可多次指定，如 --rank-metrics 播放量 --rank-metrics 涨粉数）')
+@click.option('--rank-top', type=int, default=5, show_default=True,
+              help='变化排行每个（周期×指标）的 Top N')
+def cmd_summary(input_file, output_file, group_by, start, end, compare, ref_date,
+                rank_metrics, rank_top):
     """汇总播放、点赞、完播、涨粉等核心指标，含周期对比。"""
     header('汇总数据指标（含周期对比）')
 
@@ -316,6 +321,15 @@ def cmd_summary(input_file, output_file, group_by, start, end, compare, ref_date
             if compare and date_col and rank_rows:
                 rdf = pd.DataFrame(rank_rows)
                 if not rdf.empty:
+                    def _match_metric(m):
+                        if not rank_metrics:
+                            return True
+                        return any((mt in m) or (m in mt) for mt in rank_metrics)
+
+                    mask_metrics = rdf['指标'].apply(_match_metric)
+                    rdf = rdf[mask_metrics].reset_index(drop=True)
+
+                if not rdf.empty:
                     def _sort_key(row):
                         if pd.isna(row['_变化率_num']) or row['_变化率_num'] == 0:
                             if isinstance(row['变化差值'], str) and row['变化差值'].endswith('%'):
@@ -327,10 +341,10 @@ def cmd_summary(input_file, output_file, group_by, start, end, compare, ref_date
                         return abs(float(row['_变化率_num']))
                     rdf['_abs'] = rdf.apply(_sort_key, axis=1)
                     rdf_sorted = rdf.sort_values(['对比周期', '指标', '_abs'], ascending=[True, True, False])
-                    rank_top = []
+                    rank_top_rows = []
                     for (period, metric), g in rdf_sorted.groupby(['对比周期', '指标']):
                         cur_name, prev_name = period.split('vs')
-                        for i, (_, row) in enumerate(g.head(5).iterrows()):
+                        for i, (_, row) in enumerate(g.head(rank_top).iterrows()):
                             delta_val = row['变化差值']
                             direction = '→持平'
                             if isinstance(delta_val, str):
@@ -343,7 +357,7 @@ def cmd_summary(input_file, output_file, group_by, start, end, compare, ref_date
                                     direction = '↑上涨'
                                 elif delta_val < 0:
                                     direction = '↓下跌'
-                            rank_top.append({
+                            rank_top_rows.append({
                                 '排名': i + 1,
                                 '变化方向': direction,
                                 '对比周期': period,
@@ -354,16 +368,17 @@ def cmd_summary(input_file, output_file, group_by, start, end, compare, ref_date
                                 '变化差值': delta_val,
                                 '变化率%': row['变化率%'],
                             })
-                    top_df = pd.DataFrame(rank_top) if rank_top else pd.DataFrame()
+                    top_df = pd.DataFrame(rank_top_rows) if rank_top_rows else pd.DataFrame()
                     display_cols = ['对比周期', '指标', '分组值']
                     for c in ['本周', '上周', '本月', '上月']:
                         if c in rdf_sorted.columns:
                             display_cols.append(c)
                     display_cols += ['变化差值', '变化率%']
                     sheets['变化排行_明细'] = rdf_sorted[display_cols].reset_index(drop=True)
-                    if rank_top:
-                        sheets['变化排行_Top5'] = top_df
-                        info(f'\n变化排行已生成（{len(top_df)} 条 Top 记录），包含"本周vs上周"和"本月vs上月"的所有指标涨跌榜')
+                    if rank_top_rows:
+                        sheets['变化排行_TopN'] = top_df
+                        metric_hint = f'（仅指标: {", ".join(rank_metrics)}）' if rank_metrics else ''
+                        info(f'\n变化排行已生成（{len(top_df)} 条 Top{rank_top} 记录）{metric_hint}，含本周vs上周和本月vs上月')
                         top_preview = top_df.head(10)
                         print_table(top_preview.columns.tolist(), top_preview.values.tolist())
         else:

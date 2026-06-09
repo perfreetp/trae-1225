@@ -173,10 +173,18 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
         r.setdefault('max_per_day', 999)
         r.setdefault('allowed_weekdays', list(range(1, 8)))
         r.setdefault('blacklist_dates', set())
-        if isinstance(r['allowed_weekdays'], str):
-            r['allowed_weekdays'] = [int(x) for x in r['allowed_weekdays'].split(',') if x.strip()]
-        if isinstance(r['blacklist_dates'], (list, set)):
-            r['blacklist_dates'] = set(str(x) for x in r['blacklist_dates'])
+
+        aw = r['allowed_weekdays']
+        if aw is None or (isinstance(aw, (list, set, tuple)) and len(aw) == 0) or (isinstance(aw, str) and aw.strip() == ''):
+            r['allowed_weekdays'] = list(range(1, 8))
+        elif isinstance(aw, str):
+            r['allowed_weekdays'] = [int(x) for x in aw.split(',') if x.strip()]
+
+        bd = r['blacklist_dates']
+        if bd is None or (isinstance(bd, (list, set, tuple)) and len(bd) == 0) or (isinstance(bd, str) and bd.strip() == ''):
+            r['blacklist_dates'] = set()
+        elif isinstance(bd, (list, set)):
+            r['blacklist_dates'] = set(str(x) for x in bd)
         return r
 
     for fp in existing_files or []:
@@ -203,13 +211,22 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
         avail_vids = len(videos) - sum(1 for v in videos if (v.get('完整路径') or v.get('视频文件') or '') in used_video_paths)
 
     def _run_precheck():
-        """预检：计算每天容量/缺口/素材，返回诊断 dict 和 按日/按账号明细 DataFrame。"""
+        """预检：计算每天容量/缺口/素材，返回诊断 dict 和 按日/按账号/卡点排行 DataFrame。"""
         pc_daily_rows = []
         pc_account_rows = []
         total_capacity = 0
         days_short = 0
         capacity_problems = []
         all_acc_pool = accounts or ['(未指定账号)']
+
+        chokepoint_counts = {}
+
+        def _add_choke(acc, cat, detail, loss):
+            key = (acc, cat, detail)
+            if key not in chokepoint_counts:
+                chokepoint_counts[key] = {'账号ID': acc, '卡点类型': cat, '具体说明': detail, '命中天数': 0, '损失容量': 0}
+            chokepoint_counts[key]['命中天数'] += 1
+            chokepoint_counts[key]['损失容量'] += loss
 
         for d in dates:
             d_obj = parse_date(d)
@@ -223,8 +240,19 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
                 wd = d_obj.isoweekday()
                 wd_ok = wd in r['allowed_weekdays']
                 bl_ok = d not in r['blacklist_dates']
-                if not wd_ok or not bl_ok:
+
+                if not bl_ok:
+                    _add_choke(acc, '黑名单日期', f'{d} 被列入黑名单', max_pd)
                     slot_can_take = 0
+                elif not wd_ok:
+                    _add_choke(acc, '星期限制', f'周{wd}不在允许列表{str(r["allowed_weekdays"])}', max_pd)
+                    slot_can_take = 0
+                else:
+                    if hist > 0:
+                        _add_choke(acc, '历史占用', f'{d} 已占 {hist} 条', min(hist, max_pd))
+                    if slot_can_take <= 0 and max_pd > 0 and hist >= max_pd:
+                        _add_choke(acc, '每日上限', f'max_per_day={max_pd} 被历史用完', max_pd)
+
                 day_cap += slot_can_take
                 if accounts:
                     pc_account_rows.append({
@@ -263,7 +291,12 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
             '视频可用': avail_vids if videos else '(未提供)',
             '视频缺口': max(0, total_needed - avail_vids) if videos else 0,
         }
-        return pc_summary, pd.DataFrame(pc_daily_rows), pd.DataFrame(pc_account_rows), capacity_problems
+        choke_df = pd.DataFrame(list(chokepoint_counts.values())) if chokepoint_counts else pd.DataFrame(
+            columns=['账号ID', '卡点类型', '具体说明', '命中天数', '损失容量'])
+        if not choke_df.empty:
+            choke_df = choke_df.sort_values(['损失容量', '命中天数'], ascending=[False, False]).reset_index(drop=True)
+            choke_df.insert(0, '卡点排名', range(1, len(choke_df) + 1))
+        return pc_summary, pd.DataFrame(pc_daily_rows), pd.DataFrame(pc_account_rows), capacity_problems, choke_df
 
     run_pc = precheck or precheck_only
     pc_ok = True
@@ -271,10 +304,12 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
     pc_daily_df = None
     pc_account_df = None
     pc_problems = []
+    pc_choke_df = None
+    decision_flow_log = []
 
     if run_pc:
         info('\n========= 预检诊断开始 =========')
-        pc_summary, pc_daily_df, pc_account_df, pc_problems = _run_precheck()
+        pc_summary, pc_daily_df, pc_account_df, pc_problems, pc_choke_df = _run_precheck()
         pc_summary_df = pd.DataFrame(
             list(pc_summary.items()), columns=['项目', '值']
         )
@@ -285,6 +320,15 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
         print_table(preview_daily.columns.tolist(), preview_daily.values.tolist())
         if len(pc_daily_df) > 20:
             info(f'  ... 其余 {len(pc_daily_df) - 20} 天见输出文件"预检_按日容量"表')
+
+        if pc_choke_df is not None and not pc_choke_df.empty:
+            info('\n账号卡点排行（按损失容量从大到小）:')
+            preview_choke = pc_choke_df.head(15)
+            print_table(preview_choke.columns.tolist(), preview_choke.values.tolist())
+            if len(pc_choke_df) > 15:
+                info(f'  ... 还有 {len(pc_choke_df) - 15} 条，详见输出"预检_账号卡点排行"表')
+        elif accounts:
+            info('\n账号卡点排行: 无明显卡点（所有账号按规则均有可排容量）')
 
         if pc_problems:
             pc_ok = False
@@ -312,8 +356,10 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
             '预检_总览': pc_summary_df,
             '预检_按日容量': pc_daily_df,
         }
-        if accounts:
+        if accounts and pc_account_df is not None and not pc_account_df.empty:
             sheets['预检_按账号容量'] = pc_account_df
+        if pc_choke_df is not None and not pc_choke_df.empty:
+            sheets['预检_账号卡点排行'] = pc_choke_df
         if pc_problems:
             sheets['预检_容量问题'] = pd.DataFrame([{'问题': p} for p in pc_problems])
         if videos and not allow_reuse and total_needed > avail_vids:
@@ -464,16 +510,29 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
 
             for si, (slot_name, slot_time, extra_offset) in enumerate(daily_slots_pool):
                 slot_info = {'日期': d, '时间段': slot_name}
+                orig_vid_idx = vid_idx % len(videos) if videos else 0
+                orig_vid_name = videos[orig_vid_idx].get('视频文件', '') if videos else ''
+
                 vid, reused, vid_log = _pick_video(slot_info=slot_info)
                 if vid is None and videos and not allow_reuse:
                     reason = f'视频素材耗尽（第 {si + 1} 条无法分配）' + (f'；{vid_log}' if vid_log else '')
                     failed_today.append((slot_name, reason))
                     blocked_reasons.append(f'{d} | 时间段 {slot_name}: {reason}')
+                    decision_flow_log.append({
+                        '日期': d, '星期': d_obj.isoweekday(), '时间段': slot_name,
+                        '计划时间': slot_time, '最终时间': '', '最终账号': '', '最终视频': '',
+                        '状态': '失败', '失败原因': reason,
+                        '原计划账号': '', '避让原因': f'视频耗尽; {vid_log}',
+                        '最终发布时间': '',
+                    })
                     continue
 
                 base_acc = accounts[account_cursor % len(accounts)] if accounts else ''
                 account_cursor += 1
                 try_pool = _rotate_accounts(account_cursor, accounts) if accounts else ['']
+
+                t_before = len(conflict_time_log)
+                a_before = len(conflict_account_log)
 
                 final_dt, chosen_acc, err = _resolve_time(
                     d, d_obj, slot_time, base_acc,
@@ -494,6 +553,24 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
                     failed_today.append((slot_name, fail_reason))
                     blocked_reasons.append(f'{d} | 时间段 {slot_name} (想分配账号 {base_acc}): {fail_reason}')
                     account_cursor -= 1
+
+                    acc_dodges = conflict_account_log[a_before:]
+                    time_dodges = conflict_time_log[t_before:]
+                    evaded = []
+                    if time_dodges:
+                        for item in time_dodges:
+                            evaded.append(f'时间冲突: {item.get("偏移原因", "")}')
+                    if acc_dodges:
+                        for item in acc_dodges:
+                            evaded.append(f'账号: {item.get("调整原因", "")}')
+                    decision_flow_log.append({
+                        '日期': d, '星期': d_obj.isoweekday(), '时间段': slot_name,
+                        '计划时间': slot_time, '最终时间': '', '最终账号': '', '最终视频': '',
+                        '状态': '失败', '失败原因': fail_reason,
+                        '原计划账号': base_acc,
+                        '避让原因': ' | '.join(evaded[:5]) if evaded else ('视频:' + vid_log) if vid_log else '',
+                        '最终发布时间': '',
+                    })
                     continue
 
                 full_dt_str = final_dt.strftime('%Y-%m-%d %H:%M')
@@ -507,13 +584,40 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
                 if vid_path and not allow_reuse:
                     used_video_paths.add(vid_path)
 
+                video_final = vid.get('视频文件', '') if isinstance(vid, dict) else ''
+
+                acc_dodges = conflict_account_log[a_before:]
+                time_dodges = conflict_time_log[t_before:]
+                evaded = []
+                if time_dodges:
+                    for item in time_dodges:
+                        evaded.append(f'时间 {item.get("原时间","")}→{item.get("最终时间","")} ({item.get("偏移原因","")[:30]})')
+                if acc_dodges:
+                    for item in acc_dodges:
+                        evaded.append(f'账号 {item.get("原账号","")}→{item.get("最终账号","")} ({item.get("调整原因","")[:30]})')
+                vd_before = len(conflict_video_log) - 1
+                if (videos and video_final and video_final != orig_vid_name and vd_before >= 0):
+                    item = conflict_video_log[-1]
+                    evaded.append(f'视频 {item.get("原视频","")}→{item.get("最终采用视频","")} ({item.get("跳过原因","")[:30]})')
+
+                decision_flow_log.append({
+                    '日期': d, '星期': d_obj.isoweekday(), '时间段': slot_name,
+                    '计划时间': slot_time, '最终时间': final_time_str,
+                    '原计划账号': base_acc, '最终账号': chosen_acc,
+                    '原计划视频': orig_vid_name, '最终视频': video_final,
+                    '状态': '成功',
+                    '避让原因': ' | '.join(evaded[:6]),
+                    '最终发布时间': full_dt_str,
+                    '失败原因': '',
+                })
+
                 rows.append({
                     '日期': d,
                     '星期': d_obj.strftime('%A'),
                     '时间段': slot_name,
                     '发布时间': full_dt_str,
                     '账号ID': chosen_acc,
-                    '视频文件': vid.get('视频文件', '') if isinstance(vid, dict) else '',
+                    '视频文件': video_final,
                     '完整路径': vid.get('完整路径', '') if isinstance(vid, dict) else '',
                     '标题': vid.get('标题', '') if isinstance(vid, dict) else '',
                     '口播词': vid.get('口播词', '') if isinstance(vid, dict) else '',
@@ -558,6 +662,13 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
                                 '偏移分钟': step_minutes * k,
                                 '偏移原因': '最终写入前重复去重',
                             })
+                            for dfentry in decision_flow_log:
+                                if (dfentry['日期'] == df.at[idx, '日期'] and
+                                        dfentry['时间段'] == df.at[idx, '时间段'] and
+                                        dfentry['最终时间'] == orig_time):
+                                    dfentry['最终时间'] = new_dt.strftime('%H:%M')
+                                    dfentry['最终发布时间'] = new_dt.strftime('%Y-%m-%d %H:%M')
+                                    dfentry['避让原因'] = (str(dfentry.get('避让原因', '')) + f' | 最终去重+{step_minutes * k}m').strip(' | ')
                         break
         df = df.drop(columns=['_dt'])
         df.insert(0, '序号', range(1, len(df) + 1))
@@ -630,6 +741,8 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
         sheets['预检_按日容量'] = pc_daily_df
         if accounts and pc_account_df is not None and not pc_account_df.empty:
             sheets['预检_按账号容量'] = pc_account_df
+        if pc_choke_df is not None and not pc_choke_df.empty:
+            sheets['预检_账号卡点排行'] = pc_choke_df
         if pc_problems:
             sheets['预检_容量问题'] = pd.DataFrame([{'问题': p} for p in pc_problems])
 
@@ -662,6 +775,17 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
         else:
             info('视频避让统计: 无需调整（视频分配一步到位）')
 
+        if decision_flow_log:
+            flow_df = pd.DataFrame(decision_flow_log)
+            if not flow_df.empty:
+                flow_df = flow_df.sort_values(['日期', '计划时间']).reset_index(drop=True)
+                flow_df.insert(0, '流水号', range(1, len(flow_df) + 1))
+                sheets['排期决策流水'] = flow_df
+                info(f'排期决策流水: 共 {len(flow_df)} 条（按日期时间排序）')
+                flow_preview_cols = ['流水号', '日期', '时间段', '计划时间', '最终时间', '原计划账号', '最终账号', '状态']
+                avail_cols = [c for c in flow_preview_cols if c in flow_df.columns]
+                print_table(avail_cols, flow_df[avail_cols].head(12).values.tolist())
+
     write_multi_sheet(sheets, output_file)
     written = list(sheets.keys())
     msg = f'诊断/排期已保存: {output_file}（共 {len(written)} 个表: {", ".join(written)}）'
@@ -673,7 +797,19 @@ def cmd_generate(start_date, end_date, accounts_file, videos_file, output_file,
 
 
 def _load_rules(rules_file):
-    """从 JSON 或 Excel 加载运营规则。"""
+    """从 JSON 或 Excel 加载运营规则。空单元格/NaN 视为未配置，走默认值。"""
+    def _is_blank(value):
+        if value is None:
+            return True
+        if isinstance(value, float) and pd.isna(value):
+            return True
+        s = str(value).strip()
+        if s == '':
+            return True
+        if s.lower() in ('nan', 'none', 'null', 'na', '-'):
+            return True
+        return False
+
     ext = os.path.splitext(rules_file)[1].lower()
     if ext == '.json':
         import json
@@ -682,23 +818,34 @@ def _load_rules(rules_file):
     df = read_data(rules_file)
     rules = {}
     for _, r in df.iterrows():
-        acc = str(r.get('账号ID') or r.iloc[0]).strip()
+        acc_val = r.get('账号ID') if '账号ID' in df.columns else r.iloc[0]
+        acc = '' if _is_blank(acc_val) else str(acc_val).strip()
         if not acc:
             continue
         entry = {}
         if 'max_per_day' in df.columns:
-            try:
-                entry['max_per_day'] = int(r['max_per_day'])
-            except (ValueError, TypeError):
-                pass
+            mpd = r['max_per_day']
+            if not _is_blank(mpd):
+                try:
+                    entry['max_per_day'] = int(float(mpd))
+                except (ValueError, TypeError):
+                    pass
         if 'allowed_weekdays' in df.columns:
-            wd = str(r['allowed_weekdays']).strip()
-            if wd:
-                entry['allowed_weekdays'] = [int(x) for x in re.split(r'[,\s]+', wd) if x.isdigit()]
+            wd_raw = r['allowed_weekdays']
+            if not _is_blank(wd_raw):
+                wd = str(wd_raw).strip()
+                if wd:
+                    digits = [int(x) for x in re.split(r'[,\s]+', wd) if x.isdigit()]
+                    if digits:
+                        entry['allowed_weekdays'] = digits
         if 'blacklist_dates' in df.columns:
-            bd = str(r['blacklist_dates']).strip()
-            if bd:
-                entry['blacklist_dates'] = set(x.strip() for x in re.split(r'[,\s]+', bd) if x.strip())
+            bd_raw = r['blacklist_dates']
+            if not _is_blank(bd_raw):
+                bd = str(bd_raw).strip()
+                if bd:
+                    parts = [x.strip() for x in re.split(r'[,\s]+', bd) if x.strip()]
+                    if parts:
+                        entry['blacklist_dates'] = set(parts)
         rules[acc] = entry
     return rules
 
