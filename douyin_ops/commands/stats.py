@@ -41,11 +41,18 @@ def _resolve_col(df_columns: list, target: str) -> str:
 
 
 def _to_num(series, is_percent=False):
-    """将列转为数值。is_percent=True 时带 % 的文本按 0-1 比例换算。"""
+    """将列转为数值。is_percent=True 时:
+       - 有 % 去掉后 /100
+       - 值 > 1 视作带百分号的整数（38 → 0.38）
+       - 值 ≤ 1 视作真实比例（0.38 → 0.38，保持不变）
+       这样 "38%" / "38" / "0.38" 三种写法归一后一致。
+    """
     s = series.astype(str).str.replace(',', '', regex=False)
     if is_percent:
         s = s.str.replace('%', '', regex=False).str.strip()
-        s = pd.to_numeric(s, errors='coerce') / 100
+        s = pd.to_numeric(s, errors='coerce')
+        mask_large = s > 1
+        s[mask_large] = s[mask_large] / 100
     else:
         s = pd.to_numeric(s, errors='coerce')
     return s.fillna(0)
@@ -148,7 +155,10 @@ def cmd_summary(input_file, output_file, group_by, start, end, compare, ref_date
             for m in col_map:
                 vals = num_cols[m][mask]
                 is_pct = (m == '完播率')
-                res[m] = vals.mean() if is_pct else vals.sum()
+                v = vals.mean() if is_pct else vals.sum()
+                if pd.isna(v):
+                    v = 0
+                res[m] = v
             return res, int(mask.sum())
 
         tw, tw_cnt = _slice(this_week_start, this_week_end)
@@ -220,25 +230,66 @@ def cmd_summary(input_file, output_file, group_by, start, end, compare, ref_date
                 if '完播率' in col and col != gb:
                     grouped[col] = grouped[col].apply(lambda x: f'{x:.2%}' if pd.notna(x) else x)
 
+            rank_rows = []
+
             if compare and date_col:
-                for m in col_map:
-                    is_pct = (m == '完播率')
-                    val_col = m if is_pct else m + '_总计'
-                    tw_vals = work[(work['_date'] >= this_week_start) & (work['_date'] <= this_week_end)].groupby(gb)[m].agg('mean' if is_pct else 'sum')
-                    lw_vals = work[(work['_date'] >= last_week_start) & (work['_date'] <= last_week_end)].groupby(gb)[m].agg('mean' if is_pct else 'sum')
-                    tw_name = f'本周_{m}'
-                    lw_name = f'上周_{m}'
-                    diff_name = f'环比_{m}'
-                    merged = pd.DataFrame({tw_name: tw_vals, lw_name: lw_vals}).fillna(0)
-                    if is_pct:
-                        merged[diff_name] = (merged[tw_name] - merged[lw_name]).apply(lambda x: f'{x:+.2%}')
-                        merged[tw_name] = merged[tw_name].apply(lambda x: f'{x:.2%}')
-                        merged[lw_name] = merged[lw_name].apply(lambda x: f'{x:.2%}')
-                    else:
-                        merged[diff_name] = (merged[tw_name] - merged[lw_name]).astype(int).apply(lambda x: f'{x:+d}')
-                        merged[tw_name] = merged[tw_name].astype(int)
-                        merged[lw_name] = merged[lw_name].astype(int)
-                    grouped = grouped.merge(merged, left_on=gb, right_index=True, how='left')
+                def _attach_compare(period_label, s_dt, e_dt, s_dt_prev, e_dt_prev, diff_label):
+                    """给 grouped 追加一组对比列，并把所有指标的环比行写入 rank_rows。"""
+                    nonlocal grouped
+                    for m in col_map:
+                        is_pct = (m == '完播率')
+                        agg_f = 'mean' if is_pct else 'sum'
+                        mask_cur = (work['_date'] >= s_dt) & (work['_date'] <= e_dt)
+                        mask_prev = (work['_date'] >= s_dt_prev) & (work['_date'] <= e_dt_prev)
+                        cur_vals = work[mask_cur].groupby(gb)[m].agg(agg_f)
+                        prev_vals = work[mask_prev].groupby(gb)[m].agg(agg_f)
+                        cur_name = f'{period_label}_{m}'
+                        prev_name = f'{diff_label}_{m}'
+                        delta_name = f'变化_{m}_{period_label}vs{diff_label}'
+                        merged = pd.DataFrame({cur_name: cur_vals, prev_name: prev_vals}).fillna(0)
+                        if is_pct:
+                            delta_raw = merged[cur_name] - merged[prev_name]
+                            merged[delta_name] = delta_raw.apply(lambda x: f'{x:+.2%}')
+                            merged[cur_name] = merged[cur_name].apply(lambda x: f'{x:.2%}')
+                            merged[prev_name] = merged[prev_name].apply(lambda x: f'{x:.2%}')
+                        else:
+                            delta_raw = merged[cur_name] - merged[prev_name]
+                            merged[delta_name] = delta_raw.astype(int).apply(lambda x: f'{x:+d}')
+                            merged[cur_name] = merged[cur_name].astype(int)
+                            merged[prev_name] = merged[prev_name].astype(int)
+
+                        for key, a in merged.iterrows():
+                            b_val = (merged[prev_name].loc[key])
+                            rate_label = 'N/A'
+                            rate_num = None
+                            if is_pct:
+                                rate_num = None
+                            else:
+                                try:
+                                    pn = int(str(b_val).replace(',', '')) if not isinstance(b_val, (int, float)) else float(b_val)
+                                except (ValueError, TypeError):
+                                    pn = 0
+                                if pn:
+                                    rate_num = (float(a[cur_name]) - pn) / abs(pn)
+                                    rate_label = f'{rate_num * 100:+.1f}%'
+                            rank_rows.append({
+                                '分组维度': group_by,
+                                '分组值': key,
+                                '对比周期': f'{period_label}vs{diff_label}',
+                                '指标': m,
+                                period_label: a[cur_name],
+                                diff_label: b_val,
+                                '变化差值': a[delta_name],
+                                '变化率%': rate_label,
+                                '_变化率_num': rate_num if rate_num is not None else 0,
+                            })
+
+                        grouped = grouped.merge(merged, left_on=gb, right_index=True, how='left')
+
+                _attach_compare('本周', this_week_start, this_week_end,
+                                last_week_start, last_week_end, '上周')
+                _attach_compare('本月', this_month_start, ref + timedelta(days=1) - timedelta(seconds=1),
+                                last_month_start, last_month_end, '上月')
 
             ordered = [gb, '条数']
             base_metrics = [m for m in col_map if m != '完播率']
@@ -250,15 +301,71 @@ def cmd_summary(input_file, output_file, group_by, start, end, compare, ref_date
             if '完播率' in grouped.columns:
                 ordered.append('完播率')
             if compare and date_col:
+                compare_tags = []
                 for m in col_map:
-                    for tag in [f'本周_{m}', f'上周_{m}', f'环比_{m}']:
-                        if tag in grouped.columns:
-                            ordered.append(tag)
+                    for pair in [('本周', '上周'), ('本月', '上月')]:
+                        for tag in [f'{pair[0]}_{m}', f'{pair[1]}_{m}', f'变化_{m}_{pair[0]}vs{pair[1]}']:
+                            if tag in grouped.columns:
+                                ordered.append(tag)
             grouped = grouped[[c for c in ordered if c in grouped.columns]]
             sheets[f'按{group_by}'] = grouped
             info(f'\n按{group_by}分组: {len(grouped)} 组')
             preview_cols = list(grouped.columns[:min(8, len(grouped.columns))])
             print_table(preview_cols, grouped.head(10)[preview_cols].values.tolist())
+
+            if compare and date_col and rank_rows:
+                rdf = pd.DataFrame(rank_rows)
+                if not rdf.empty:
+                    def _sort_key(row):
+                        if pd.isna(row['_变化率_num']) or row['_变化率_num'] == 0:
+                            if isinstance(row['变化差值'], str) and row['变化差值'].endswith('%'):
+                                try:
+                                    return abs(float(row['变化差值'].replace('%', '').replace('+', '')))
+                                except ValueError:
+                                    return 0
+                            return 0
+                        return abs(float(row['_变化率_num']))
+                    rdf['_abs'] = rdf.apply(_sort_key, axis=1)
+                    rdf_sorted = rdf.sort_values(['对比周期', '指标', '_abs'], ascending=[True, True, False])
+                    rank_top = []
+                    for (period, metric), g in rdf_sorted.groupby(['对比周期', '指标']):
+                        cur_name, prev_name = period.split('vs')
+                        for i, (_, row) in enumerate(g.head(5).iterrows()):
+                            delta_val = row['变化差值']
+                            direction = '→持平'
+                            if isinstance(delta_val, str):
+                                if delta_val.startswith('+'):
+                                    direction = '↑上涨'
+                                elif delta_val.startswith('-'):
+                                    direction = '↓下跌'
+                            elif isinstance(delta_val, (int, float)):
+                                if delta_val > 0:
+                                    direction = '↑上涨'
+                                elif delta_val < 0:
+                                    direction = '↓下跌'
+                            rank_top.append({
+                                '排名': i + 1,
+                                '变化方向': direction,
+                                '对比周期': period,
+                                '指标': metric,
+                                '分组值': row['分组值'],
+                                '本期': row.get(cur_name, ''),
+                                '上期': row.get(prev_name, ''),
+                                '变化差值': delta_val,
+                                '变化率%': row['变化率%'],
+                            })
+                    top_df = pd.DataFrame(rank_top) if rank_top else pd.DataFrame()
+                    display_cols = ['对比周期', '指标', '分组值']
+                    for c in ['本周', '上周', '本月', '上月']:
+                        if c in rdf_sorted.columns:
+                            display_cols.append(c)
+                    display_cols += ['变化差值', '变化率%']
+                    sheets['变化排行_明细'] = rdf_sorted[display_cols].reset_index(drop=True)
+                    if rank_top:
+                        sheets['变化排行_Top5'] = top_df
+                        info(f'\n变化排行已生成（{len(top_df)} 条 Top 记录），包含"本周vs上周"和"本月vs上月"的所有指标涨跌榜')
+                        top_preview = top_df.head(10)
+                        print_table(top_preview.columns.tolist(), top_preview.values.tolist())
         else:
             warn(f'分组字段不存在: {gb}')
 
